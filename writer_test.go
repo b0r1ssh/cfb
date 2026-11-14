@@ -7,6 +7,8 @@ import (
 )
 
 func TestRoundTripFlatStreams(t *testing.T) {
+	t.Parallel()
+
 	root := NewRoot()
 	small := payload(100, 1)
 	big := payload(10_000, 2)
@@ -41,6 +43,8 @@ func TestRoundTripFlatStreams(t *testing.T) {
 }
 
 func TestRoundTripNestedStorages(t *testing.T) {
+	t.Parallel()
+
 	root := NewRoot()
 	root.SetCLSID(MustParseCLSID("00020D0B-0000-0000-C000-000000000046"))
 	sub, err := root.AddStorage("Sub")
@@ -79,6 +83,8 @@ func TestRoundTripNestedStorages(t *testing.T) {
 }
 
 func TestStreamSmallerThanMiniCutoff(t *testing.T) {
+	t.Parallel()
+
 	root := NewRoot()
 	data := payload(50, 7) // lives in the mini stream
 	if err := root.AddStream("Tiny", data); err != nil {
@@ -103,6 +109,8 @@ func TestStreamSmallerThanMiniCutoff(t *testing.T) {
 }
 
 func TestChildrenAreSortedCaseInsensitively(t *testing.T) {
+	t.Parallel()
+
 	root := NewRoot()
 	// Same length, so length-first ordering (see the test below) can't mask
 	// a case-insensitive comparison bug.
@@ -112,9 +120,10 @@ func TestChildrenAreSortedCaseInsensitively(t *testing.T) {
 		}
 	}
 	r := writeAndOpen(t, root)
-	var got []string
-	for _, c := range r.Root.Children {
-		got = append(got, c.Name)
+
+	got := make([]string, len(r.Root.Children))
+	for i, c := range r.Root.Children {
+		got[i] = c.Name
 	}
 	want := []string{"Kiwi", "lime", "Pear", "plum"}
 	if len(got) != len(want) {
@@ -128,6 +137,8 @@ func TestChildrenAreSortedCaseInsensitively(t *testing.T) {
 }
 
 func TestChildrenAreSortedByLengthBeforeValue(t *testing.T) {
+	t.Parallel()
+
 	root := NewRoot()
 	for _, name := range []string{"banana", "Apple", "cherry", "apricot"} {
 		if err := root.AddStream(name, nil); err != nil {
@@ -135,9 +146,10 @@ func TestChildrenAreSortedByLengthBeforeValue(t *testing.T) {
 		}
 	}
 	r := writeAndOpen(t, root)
-	var got []string
-	for _, c := range r.Root.Children {
-		got = append(got, c.Name)
+
+	got := make([]string, len(r.Root.Children))
+	for i, c := range r.Root.Children {
+		got[i] = c.Name
 	}
 	want := []string{"Apple", "banana", "cherry", "apricot"} // 5, 6, 6, 7 UTF-16 units
 	if len(got) != len(want) {
@@ -151,6 +163,8 @@ func TestChildrenAreSortedByLengthBeforeValue(t *testing.T) {
 }
 
 func TestDuplicateNameRejected(t *testing.T) {
+	t.Parallel()
+
 	root := NewRoot()
 	if err := root.AddStream("X", nil); err != nil {
 		t.Fatal(err)
@@ -161,6 +175,8 @@ func TestDuplicateNameRejected(t *testing.T) {
 }
 
 func TestAddStorageDuplicateNameRejected(t *testing.T) {
+	t.Parallel()
+
 	root := NewRoot()
 	if _, err := root.AddStorage("Sub"); err != nil {
 		t.Fatal(err)
@@ -174,6 +190,8 @@ func TestAddStorageDuplicateNameRejected(t *testing.T) {
 }
 
 func TestAddStreamNameValidation(t *testing.T) {
+	t.Parallel()
+
 	cases := []struct {
 		name   string
 		reason string
@@ -200,6 +218,8 @@ func TestAddStreamNameValidation(t *testing.T) {
 }
 
 func TestWriteToRequiresRoot(t *testing.T) {
+	t.Parallel()
+
 	root := NewRoot()
 	sub, err := root.AddStorage("Sub")
 	if err != nil {
@@ -212,6 +232,8 @@ func TestWriteToRequiresRoot(t *testing.T) {
 }
 
 func TestSectorAllocatorRequiresDifat(t *testing.T) {
+	t.Parallel()
+
 	a := &sectorAllocator{fat: make([]uint32, 20_000)}
 	fatStart, fatSectors, difatStart, difatSectors := a.layoutFatAndDifat()
 
@@ -237,6 +259,8 @@ func TestSectorAllocatorRequiresDifat(t *testing.T) {
 }
 
 func TestEncodeDifat(t *testing.T) {
+	t.Parallel()
+
 	const fatStart = 1000
 	const fatSectors = 250 // 141 sectors beyond the header's 109 inline slots
 	const difatStart = 2000
@@ -279,6 +303,8 @@ func TestEncodeDifat(t *testing.T) {
 }
 
 func TestBuildHeaderDifatField(t *testing.T) {
+	t.Parallel()
+
 	h := headerFields{fatSectors: 5, dirStart: 1, miniFatStart: sectorEndOfChain, fatStart: 2}
 
 	h.difatStart, h.difatSectors = 42, 3

@@ -1,0 +1,101 @@
+name: Publish Go module
+
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: Semantic version component to increment
+        required: true
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.merged == true &&
+       !contains(github.event.pull_request.labels.*.name, 'skip-release'))
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Determine next version
+        id: version
+        shell: bash
+        env:
+          MANUAL_RELEASE_TYPE: ${{ inputs.release_type }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+
+          release_type="${MANUAL_RELEASE_TYPE:-patch}"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            release_label_count=0
+            for candidate in patch minor major; do
+              if [[ ",$PR_LABELS," == *",$candidate,"* ]]; then
+                release_type="$candidate"
+                release_label_count=$((release_label_count + 1))
+              fi
+            done
+
+            if [ "$release_label_count" -gt 1 ]; then
+              echo "Use only one release label: patch, minor, or major." >&2
+              exit 1
+            fi
+          fi
+
+          latest=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n 1 || true)
+
+          if [ -z "$latest" ]; then
+            case "$release_type" in
+              major) next="v1.0.0" ;;
+              minor) next="v0.1.0" ;;
+              patch) next="v0.0.1" ;;
+            esac
+          else
+            version="${latest#v}"
+            IFS='.' read -r major minor patch <<< "$version"
+            case "$release_type" in
+              major) next="v$((major + 1)).0.0" ;;
+              minor) next="v${major}.$((minor + 1)).0" ;;
+              patch) next="v${major}.${minor}.$((patch + 1))" ;;
+              *) echo "Unsupported release type: $release_type" >&2; exit 1 ;;
+            esac
+          fi
+
+          echo "Releasing $next ($release_type bump)"
+          echo "next_version=$next" >> "$GITHUB_OUTPUT"
+
+      - name: Create Git tag and GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEXT_VERSION: ${{ steps.version.outputs.next_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if git rev-parse "$NEXT_VERSION" >/dev/null 2>&1; then
+            echo "Tag $NEXT_VERSION already exists. Skipping release."
+            exit 0
+          fi
+
+          git tag "$NEXT_VERSION"
+          git push origin "$NEXT_VERSION"
+          gh release create "$NEXT_VERSION" --generate-notes --verify-tag
