@@ -5,7 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"math"
 	"strings"
+	"time"
 	"unicode/utf16"
 )
 
@@ -24,11 +27,28 @@ type Reader struct {
 	Root *Entry
 }
 
+func (r *Reader) Version() int {
+	return int(r.version)
+}
+
+func (r *Reader) SectorSize() int {
+	return r.sectorSize
+}
+
 type Entry struct {
-	Name     string
-	Kind     EntryKind
-	CLSID    CLSID
-	Size     uint64
+	Name  string
+	Kind  EntryKind
+	CLSID CLSID
+	// StateBits holds the application-defined flags of a storage.
+	StateBits uint32
+	// Created and Modified are the zero Time when the file does not record
+	// them, which is always the case for streams.
+	Created  time.Time
+	Modified time.Time
+	// Size is the length in bytes of a stream; it is 0 for storages.
+	Size uint64
+	// Children holds the entries of a storage, in the format's sort order
+	// (shorter names first, then case-insensitively by code unit).
 	Children []*Entry
 
 	owner    *Reader
@@ -52,18 +72,61 @@ func (e *Entry) Find(name string) *Entry {
 	return nil
 }
 
+func (e *Entry) Lookup(path string) *Entry {
+	cur := e
+	for _, name := range strings.Split(path, "/") {
+		if name == "" {
+			continue
+		}
+		if cur = cur.Find(name); cur == nil {
+			return nil
+		}
+	}
+	return cur
+}
+
+func (e *Entry) Walk(fn func(path string, entry *Entry) error) error {
+	return e.walk("", fn)
+}
+
+func (e *Entry) walk(prefix string, fn func(path string, entry *Entry) error) error {
+	for _, c := range e.Children {
+		p := prefix + c.Name
+		if err := fn(p, c); err != nil {
+			if errors.Is(err, fs.SkipDir) {
+				continue
+			}
+			return err
+		}
+		if err := c.walk(p+"/", fn); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (e *Entry) Open() (*Stream, error) {
 	if e.Kind != KindStream {
 		return nil, fmt.Errorf("cfb: %q is a %s, not a stream", e.Name, e.Kind)
 	}
 
+	if e.Size > math.MaxInt64 {
+		return nil, fmt.Errorf("%w: stream %q has an impossible size", ErrCorrupt, e.Name)
+	}
+
 	mini := e.Size < e.owner.miniCutoff
-	unit := sectorSize512
+	unit := uint64(e.owner.sectorSize)
 	if mini {
 		unit = miniSectSize
 	}
 
-	chain, err := e.owner.sectorChain(e.startSec, mini, divRoundUp(int(e.Size), unit))
+	// Computed in uint64 so a huge size taken from the file cannot overflow.
+	limit := math.MaxInt
+	if sectors := (e.Size + unit - 1) / unit; sectors < math.MaxInt {
+		limit = int(sectors)
+	}
+
+	chain, err := e.owner.sectorChain(e.startSec, mini, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -82,15 +145,18 @@ func (e *Entry) Bytes() ([]byte, error) {
 func Open(src io.ReaderAt, size int64) (*Reader, error) {
 	head := make([]byte, sectorSize512)
 	if _, err := src.ReadAt(head, 0); err != nil {
-		return nil, fmt.Errorf("cfb: short header: %v", err)
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			return nil, fmt.Errorf("%w: short header", ErrNotCompoundFile)
+		}
+		return nil, fmt.Errorf("cfb: reading header: %w", err)
 	}
 
 	if !bytes.Equal(head[:8], magic[:]) {
-		return nil, fmt.Errorf("cfb: bad signature")
+		return nil, fmt.Errorf("%w: bad signature", ErrNotCompoundFile)
 	}
 
 	if byteOrder.Uint16(head[0x1C:]) != 0xFFFE {
-		return nil, fmt.Errorf("cfb: unexpected byte order mark")
+		return nil, fmt.Errorf("%w: unexpected byte order mark", ErrCorrupt)
 	}
 
 	r := &Reader{src: src, size: size, version: byteOrder.Uint16(head[0x1A:])}
@@ -101,11 +167,11 @@ func Open(src io.ReaderAt, size int64) (*Reader, error) {
 	case r.version == 4 && shift == 12:
 		r.sectorSize = 4096
 	default:
-		return nil, fmt.Errorf("cfb: unsupported version %d / sector shift %d", r.version, shift)
+		return nil, fmt.Errorf("%w: version %d / sector shift %d", ErrUnsupported, r.version, shift)
 	}
 
 	if byteOrder.Uint16(head[0x20:]) != 6 {
-		return nil, fmt.Errorf("cfb: unexpected mini sector shift")
+		return nil, fmt.Errorf("%w: unexpected mini sector shift", ErrUnsupported)
 	}
 
 	fatCount := int(byteOrder.Uint32(head[0x2C:]))
@@ -117,7 +183,7 @@ func Open(src io.ReaderAt, size int64) (*Reader, error) {
 
 	maxSectors := int(size / int64(r.sectorSize))
 	if fatCount < 0 || fatCount > maxSectors || difatCount < 0 || difatCount > maxSectors {
-		return nil, fmt.Errorf("cfb: sector counts larger than the file itself")
+		return nil, fmt.Errorf("%w: sector counts larger than the file itself", ErrCorrupt)
 	}
 
 	fatLocators, err := r.collectFatLocators(head, fatCount, difatStart, difatCount, maxSectors)
@@ -143,7 +209,7 @@ func Open(src io.ReaderAt, size int64) (*Reader, error) {
 
 	entries := parseDirentArray(dirBytes, r.version)
 	if len(entries) == 0 || entries[0].kind != KindRoot {
-		return nil, fmt.Errorf("cfb: missing root entry")
+		return nil, fmt.Errorf("%w: missing root entry", ErrCorrupt)
 	}
 
 	if miniFatStart != sectorEndOfChain && miniFatStart != sectorFree {
@@ -185,7 +251,7 @@ func (r *Reader) collectFatLocators(head []byte, fatCount int, difatStart uint32
 	s := difatStart
 	for n := 0; s != sectorEndOfChain && s != sectorFree && len(out) < fatCount; n++ {
 		if n > difatCount || n > maxSectors {
-			return nil, fmt.Errorf("cfb: DIFAT chain longer than declared")
+			return nil, fmt.Errorf("%w: DIFAT chain longer than declared", ErrCorrupt)
 		}
 		sec, err := r.sector(s)
 		if err != nil {
@@ -197,7 +263,7 @@ func (r *Reader) collectFatLocators(head []byte, fatCount int, difatStart uint32
 		s = byteOrder.Uint32(sec[4*perSector:])
 	}
 	if len(out) != fatCount {
-		return nil, fmt.Errorf("cfb: found %d FAT sectors, header declares %d", len(out), fatCount)
+		return nil, fmt.Errorf("%w: found %d FAT sectors, header declares %d", ErrCorrupt, len(out), fatCount)
 	}
 	return out, nil
 }
@@ -207,6 +273,8 @@ type dirent struct {
 	kind               EntryKind
 	left, right, child uint32
 	clsid              CLSID
+	stateBits          uint32
+	created, modified  uint64
 	start              uint32
 	size               uint64
 }
@@ -238,6 +306,9 @@ func (d *dirent) parse(b []byte) {
 	d.right = byteOrder.Uint32(b[0x48:])
 	d.child = byteOrder.Uint32(b[0x4C:])
 	copy(d.clsid[:], b[0x50:0x60])
+	d.stateBits = byteOrder.Uint32(b[0x60:])
+	d.created = byteOrder.Uint64(b[0x64:])
+	d.modified = byteOrder.Uint64(b[0x6C:])
 	d.start = byteOrder.Uint32(b[0x74:])
 	d.size = byteOrder.Uint64(b[0x78:])
 }
@@ -247,7 +318,11 @@ func (r *Reader) buildTree(flat []dirent) (*Entry, error) {
 	var materialize func(id uint32) (*Entry, error)
 	materialize = func(id uint32) (*Entry, error) {
 		d := &flat[id]
-		e := &Entry{Name: d.name, Kind: d.kind, CLSID: d.clsid, owner: r, startSec: d.start}
+		e := &Entry{
+			Name: d.name, Kind: d.kind, CLSID: d.clsid, StateBits: d.stateBits,
+			Created: filetimeToTime(d.created), Modified: filetimeToTime(d.modified),
+			owner: r, startSec: d.start,
+		}
 		if d.kind == KindStream {
 			e.Size = d.size
 		}
@@ -259,7 +334,7 @@ func (r *Reader) buildTree(flat []dirent) (*Entry, error) {
 				}
 
 				if int(id) >= len(flat) || seen[id] {
-					return fmt.Errorf("cfb: directory tree is corrupt or cyclic")
+					return fmt.Errorf("%w: directory tree is broken or cyclic", ErrCorrupt)
 				}
 
 				seen[id] = true
@@ -293,17 +368,17 @@ func (r *Reader) buildTree(flat []dirent) (*Entry, error) {
 
 func (r *Reader) sector(n uint32) ([]byte, error) {
 	if n > sectorMaxRegular {
-		return nil, fmt.Errorf("cfb: sector number %#x is a reserved value", n)
+		return nil, fmt.Errorf("%w: sector number %#x is a reserved value", ErrCorrupt, n)
 	}
 
 	off := (int64(n) + 1) * int64(r.sectorSize)
 	if off+int64(r.sectorSize) > r.size {
-		return nil, fmt.Errorf("cfb: sector %d is beyond the end of the file", n)
+		return nil, fmt.Errorf("%w: sector %d is beyond the end of the file", ErrCorrupt, n)
 	}
 
 	buf := make([]byte, r.sectorSize)
 	if _, err := r.src.ReadAt(buf, off); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("cfb: reading sector %d: %w", n, err)
 	}
 
 	return buf, nil
@@ -313,8 +388,9 @@ func (r *Reader) readMetadataChain(start uint32) ([]byte, error) {
 	var out []byte
 	s := start
 	for n := 0; s != sectorEndOfChain; n++ {
-		if int(s) >= len(r.fat) || n > len(r.fat) {
-			return nil, fmt.Errorf("cfb: sector chain is broken or cyclic")
+		// A chain holding more bytes than the file must revisit a sector.
+		if int(s) >= len(r.fat) || n > len(r.fat) || int64(len(out)) >= r.size {
+			return nil, fmt.Errorf("%w: sector chain is broken or cyclic", ErrCorrupt)
 		}
 
 		sec, err := r.sector(s)
@@ -334,11 +410,18 @@ func (r *Reader) sectorChain(start uint32, mini bool, limit int) ([]uint32, erro
 		fat = r.miniFat
 	}
 
+	// A chain longer than the table, or than the file has sectors, must
+	// revisit a sector.
+	maxLen := len(fat)
+	if !mini {
+		maxLen = min(maxLen, int(r.size/int64(r.sectorSize)))
+	}
+
 	var out []uint32
 	s := start
 	for n := 0; s != sectorEndOfChain && len(out) < limit; n++ {
-		if int(s) >= len(fat) || n > len(fat) {
-			return nil, fmt.Errorf("cfb: sector chain is broken or cyclic")
+		if int(s) >= len(fat) || n > maxLen {
+			return nil, fmt.Errorf("%w: sector chain is broken or cyclic", ErrCorrupt)
 		}
 		out = append(out, s)
 		s = fat[s]
@@ -346,6 +429,10 @@ func (r *Reader) sectorChain(start uint32, mini bool, limit int) ([]uint32, erro
 	return out, nil
 }
 
+// Stream reads the content of a stream entry. It implements [io.Reader],
+// [io.ReaderAt] and [io.Seeker], fetching sectors on demand.
+//
+// A Stream is not safe for concurrent use; open one per goroutine.
 type Stream struct {
 	r     *Reader
 	mini  bool
@@ -473,7 +560,7 @@ func (s *Stream) miniSectorBytes(miniID uint32, within int) ([]byte, error) {
 	mainIdx := int(byteOff / int64(s.r.sectorSize))
 	mainWithin := int(byteOff % int64(s.r.sectorSize))
 	if mainIdx >= len(s.r.rootChain) {
-		return nil, fmt.Errorf("cfb: mini sector %d is beyond the mini stream container", miniID)
+		return nil, fmt.Errorf("%w: mini sector %d is beyond the mini stream container", ErrCorrupt, miniID)
 	}
 	return s.regularSectorBytes(s.r.rootChain[mainIdx], mainWithin)
 }
