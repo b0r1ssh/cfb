@@ -17,6 +17,8 @@ func minimalValidFile(t *testing.T) []byte {
 }
 
 func TestOpenRejectsGarbage(t *testing.T) {
+	t.Parallel()
+
 	_, err := Open(bytes.NewReader(make([]byte, 512)), 512)
 	if err == nil {
 		t.Fatal("expected an error for a non-CFB file")
@@ -24,6 +26,8 @@ func TestOpenRejectsGarbage(t *testing.T) {
 }
 
 func TestOpenRejectsShortHeader(t *testing.T) {
+	t.Parallel()
+
 	short := make([]byte, 100) // shorter than one 512-byte sector
 	if _, err := Open(bytes.NewReader(short), int64(len(short))); err == nil {
 		t.Fatal("expected an error for a file shorter than one header sector")
@@ -31,6 +35,8 @@ func TestOpenRejectsShortHeader(t *testing.T) {
 }
 
 func TestOpenHeaderValidation(t *testing.T) {
+	t.Parallel()
+
 	base := minimalValidFile(t)
 
 	cases := []struct {
@@ -61,6 +67,8 @@ func TestOpenHeaderValidation(t *testing.T) {
 }
 
 func TestCollectFatLocatorsRejectsChainLongerThanDeclared(t *testing.T) {
+	t.Parallel()
+
 	const perSector = sectorSize512/4 - 1           // 127 locators per DIFAT sector
 	const fatCount = headerFatSlots + perSector + 1 // more than one full DIFAT sector can declare
 
@@ -83,6 +91,8 @@ func TestCollectFatLocatorsRejectsChainLongerThanDeclared(t *testing.T) {
 }
 
 func TestReadMetadataChainDetectsCycle(t *testing.T) {
+	t.Parallel()
+
 	buf := minimalValidFile(t)
 	head := buf[:sectorSize512]
 	dirStart := byteOrder.Uint32(head[0x30:])
@@ -98,6 +108,8 @@ func TestReadMetadataChainDetectsCycle(t *testing.T) {
 }
 
 func TestSectorChainDetectsCycle(t *testing.T) {
+	t.Parallel()
+
 	root := NewRoot()
 	data := payload(5000, 9) // large enough to need several regular sectors
 	if err := root.AddStream("Data", data); err != nil {
@@ -134,6 +146,8 @@ func TestSectorChainDetectsCycle(t *testing.T) {
 }
 
 func TestSectorRejectsReservedAndOutOfRangeNumbers(t *testing.T) {
+	t.Parallel()
+
 	r := writeAndOpen(t, NewRoot())
 	if _, err := r.sector(sectorDIFAT); err == nil {
 		t.Fatal("expected an error for a reserved sector number")
@@ -145,6 +159,8 @@ func TestSectorRejectsReservedAndOutOfRangeNumbers(t *testing.T) {
 }
 
 func TestEntryIsRootAndFindMiss(t *testing.T) {
+	t.Parallel()
+
 	root := NewRoot()
 	if err := root.AddStream("Only", nil); err != nil {
 		t.Fatal(err)
@@ -162,6 +178,8 @@ func TestEntryIsRootAndFindMiss(t *testing.T) {
 }
 
 func TestEntryOpenAndBytesOnNonStreamFail(t *testing.T) {
+	t.Parallel()
+
 	root := NewRoot()
 	if _, err := root.AddStorage("Sub"); err != nil {
 		t.Fatal(err)
@@ -181,6 +199,8 @@ func TestEntryOpenAndBytesOnNonStreamFail(t *testing.T) {
 }
 
 func TestStreamReadAtAndSeek(t *testing.T) {
+	t.Parallel()
+
 	root := NewRoot()
 	data := payload(5000, 42) // spans several regular sectors
 	if err := root.AddStream("Data", data); err != nil {
@@ -221,6 +241,8 @@ func TestStreamReadAtAndSeek(t *testing.T) {
 }
 
 func TestStreamSeekVariants(t *testing.T) {
+	t.Parallel()
+
 	root := NewRoot()
 	data := payload(100, 3)
 	if err := root.AddStream("Data", data); err != nil {
@@ -250,6 +272,8 @@ func TestStreamSeekVariants(t *testing.T) {
 }
 
 func TestStreamReadAtNegativeOffset(t *testing.T) {
+	t.Parallel()
+
 	root := NewRoot()
 	if err := root.AddStream("Data", payload(10, 1)); err != nil {
 		t.Fatal(err)
@@ -265,6 +289,8 @@ func TestStreamReadAtNegativeOffset(t *testing.T) {
 }
 
 func TestStreamSmallerThanMiniCutoffOutOfRangeMiniSector(t *testing.T) {
+	t.Parallel()
+
 	root := NewRoot()
 	if err := root.AddStream("Tiny", payload(10, 5)); err != nil {
 		t.Fatal(err)
