@@ -2,7 +2,10 @@ package cfb
 
 import (
 	"bytes"
+	"errors"
 	"io"
+	"io/fs"
+	"reflect"
 	"testing"
 )
 
@@ -237,6 +240,181 @@ func TestStreamReadAtAndSeek(t *testing.T) {
 	}
 	if !bytes.Equal(got, data) {
 		t.Fatalf("sequential read: got %d bytes, want %d", len(got), len(data))
+	}
+}
+
+func TestOpenErrorsMatchSentinels(t *testing.T) {
+	t.Parallel()
+
+	base := minimalValidFile(t)
+	patched := func(patch func(b []byte)) []byte {
+		b := append([]byte(nil), base...)
+		patch(b)
+		return b
+	}
+
+	cases := []struct {
+		name string
+		file []byte
+		want error
+	}{
+		{"short header", make([]byte, 100), ErrNotCompoundFile},
+		{"bad signature", patched(func(b []byte) { b[0] = 0 }), ErrNotCompoundFile},
+		{"unknown version", patched(func(b []byte) { byteOrder.PutUint16(b[0x1A:], 5) }), ErrUnsupported},
+		{"directory start beyond the FAT", patched(func(b []byte) { byteOrder.PutUint32(b[0x30:], 0x00FFFFFF) }), ErrCorrupt},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := Open(bytes.NewReader(c.file), int64(len(c.file)))
+			if !errors.Is(err, c.want) {
+				t.Fatalf("Open error = %v, want one matching %v", err, c.want)
+			}
+		})
+	}
+}
+
+// treeForNavigation builds Root{ A{ B{ Leaf } Top } Z } for the Lookup and
+// Walk tests.
+func treeForNavigation(t *testing.T) *Reader {
+	t.Helper()
+
+	root := NewRoot()
+	a, err := root.AddStorage("A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := a.AddStorage("B")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.AddStream("Leaf", []byte("leaf")); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.AddStream("Top", []byte("top")); err != nil {
+		t.Fatal(err)
+	}
+	if err := root.AddStream("Z", nil); err != nil {
+		t.Fatal(err)
+	}
+	return writeAndOpen(t, root)
+}
+
+func TestEntryLookup(t *testing.T) {
+	t.Parallel()
+
+	r := treeForNavigation(t)
+
+	leaf := r.Root.Lookup("a/B/leaf") // elements match case-insensitively
+	if leaf == nil || leaf.Name != "Leaf" {
+		t.Fatalf("Lookup(a/B/leaf) = %v, want the Leaf stream", leaf)
+	}
+	if got := r.Root.Lookup("/A//B/"); got == nil || got.Name != "B" {
+		t.Fatalf("Lookup with empty elements = %v, want storage B", got)
+	}
+	if got := r.Root.Lookup(""); got != r.Root {
+		t.Fatalf("Lookup of the empty path = %v, want the receiver", got)
+	}
+	for _, p := range []string{"Missing", "A/Missing", "A/Top/Below"} {
+		if got := r.Root.Lookup(p); got != nil {
+			t.Fatalf("Lookup(%q) = %v, want nil", p, got)
+		}
+	}
+}
+
+func TestEntryWalk(t *testing.T) {
+	t.Parallel()
+
+	r := treeForNavigation(t)
+	collect := func(skip string, stop error) ([]string, error) {
+		var paths []string
+		err := r.Root.Walk(func(p string, e *Entry) error {
+			paths = append(paths, p)
+			if p == skip {
+				return fs.SkipDir
+			}
+			if stop != nil && p == "A/B" {
+				return stop
+			}
+			if r.Root.Lookup(p) != e {
+				t.Errorf("Lookup(%q) does not return the walked entry", p)
+			}
+			return nil
+		})
+		return paths, err
+	}
+
+	got, err := collect("", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"A", "A/B", "A/B/Leaf", "A/Top", "Z"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Walk visited %v, want %v", got, want)
+	}
+
+	got, err = collect("A/B", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"A", "A/B", "A/Top", "Z"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Walk with SkipDir visited %v, want %v", got, want)
+	}
+
+	stop := errors.New("stop")
+	got, err = collect("", stop)
+	if err != stop {
+		t.Fatalf("Walk error = %v, want the callback's error", err)
+	}
+	if want := []string{"A", "A/B"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Walk visited %v before stopping, want %v", got, want)
+	}
+}
+
+// TestOpenVersion4 reads a hand-assembled 4096-byte-sector file, since the
+// writer only produces version 3.
+func TestOpenVersion4(t *testing.T) {
+	t.Parallel()
+
+	const sec = 4096
+	data := payload(5000, 11) // two sectors, the second one partly used
+
+	head := make([]byte, sec)
+	copy(head, magic[:])
+	byteOrder.PutUint16(head[0x1A:], 4)      // major version
+	byteOrder.PutUint16(head[0x1C:], 0xFFFE) // byte order mark
+	byteOrder.PutUint16(head[0x1E:], 12)     // sector shift -> 4096-byte sectors
+	byteOrder.PutUint16(head[0x20:], 6)      // mini sector shift
+	byteOrder.PutUint32(head[0x28:], 1)      // directory sectors
+	byteOrder.PutUint32(head[0x2C:], 1)      // FAT sectors
+	byteOrder.PutUint32(head[0x30:], 1)      // directory starts at sector 1
+	byteOrder.PutUint32(head[0x38:], miniStreamCap)
+	byteOrder.PutUint32(head[0x3C:], sectorEndOfChain) // no mini FAT
+	byteOrder.PutUint32(head[0x44:], sectorEndOfChain) // no DIFAT
+	for i := range headerFatSlots {
+		byteOrder.PutUint32(head[0x4C+4*i:], sectorFree)
+	}
+	byteOrder.PutUint32(head[0x4C:], 0) // the FAT is sector 0
+
+	fat := encodeU32Table([]uint32{sectorFAT, sectorEndOfChain, 3, sectorEndOfChain}, sec/4)
+	dir := encodeDirentArray([]*plannedEntry{
+		{name: "Root Entry", kind: KindRoot, color: nodeColorBlack, left: noChild, right: noChild, child: 1, start: sectorEndOfChain},
+		{name: "Data", kind: KindStream, color: nodeColorBlack, left: noChild, right: noChild, child: noChild, start: 2, size: uint64(len(data))},
+	}, sec/direntSize)
+
+	file := bytes.Join([][]byte{head, fat, dir, data, make([]byte, 2*sec-len(data))}, nil)
+
+	r, err := Open(bytes.NewReader(file), int64(len(file)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Version() != 4 || r.SectorSize() != sec {
+		t.Fatalf("Version, SectorSize = %d, %d; want 4, %d", r.Version(), r.SectorSize(), sec)
+	}
+	got, err := r.Root.Find("Data").Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("got %d bytes that differ from the %d written", len(got), len(data))
 	}
 }
 

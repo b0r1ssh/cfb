@@ -21,9 +21,15 @@ contains.
   `io.ReaderAt` and `io.Seeker`, resolving sectors on demand instead of
   loading the whole stream up front — `Entry.Bytes` is a convenience
   wrapper around `io.ReadAll` for callers that just want everything.
+  Entries expose their CLSID, state bits and timestamps, and can be
+  navigated with `Entry.Lookup` (slash-separated paths) and `Entry.Walk`.
+  Failures wrap `ErrNotCompoundFile`, `ErrUnsupported` or `ErrCorrupt`, so
+  callers can tell them apart with `errors.Is`.
 - **Writer**: in-memory tree builder (`Storage`/`AddStorage`/`AddStream`)
   that writes version 3 (512-byte sector) files, which is what Outlook and
-  Excel themselves produce. Reading accepts versions 3 and 4.
+  Excel themselves produce. Reading accepts versions 3 and 4. Storages can
+  carry a CLSID, state bits and timestamps; streams are limited to 2 GiB,
+  the version 3 maximum.
 
 ## Install
 
@@ -40,9 +46,17 @@ f, _ := os.Open("workbook.xls")
 defer f.Close()
 st, _ := f.Stat()
 r, err := cfb.Open(f, st.Size())
+if errors.Is(err, cfb.ErrNotCompoundFile) {
+	// not a CFB container at all
+}
 
-book := r.Root.Find("Workbook")
+book := r.Root.Lookup("Workbook")
 data, err := book.Bytes()
+
+_ = r.Root.Walk(func(path string, e *cfb.Entry) error {
+	fmt.Println(path, e.Kind, e.Size)
+	return nil
+})
 ```
 
 Writing:
@@ -51,6 +65,7 @@ Writing:
 root := cfb.NewRoot()
 root.SetCLSID(cfb.MustParseCLSID("00020D0B-0000-0000-C000-000000000046"))
 sub, _ := root.AddStorage("__recip_version1.0_#00000000")
+sub.SetTimes(time.Now(), time.Now())
 _ = sub.AddStream("__substg1.0_3001001F", data)
 _, err := root.WriteTo(w)
 ```

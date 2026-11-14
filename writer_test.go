@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRoundTripFlatStreams(t *testing.T) {
@@ -298,6 +299,54 @@ func TestEncodeDifat(t *testing.T) {
 	for i, v := range locators {
 		if want := uint32(fatStart + headerFatSlots + i); v != want {
 			t.Fatalf("locator %d = %#x, want %#x", i, v, want)
+		}
+	}
+}
+
+func TestRoundTripStorageMetadata(t *testing.T) {
+	t.Parallel()
+
+	// FILETIME has 100 ns resolution, so pick times that survive it exactly.
+	created := time.Date(1999, 12, 31, 23, 59, 59, 123_456_700, time.UTC)
+	modified := time.Date(2026, 11, 14, 20, 0, 0, 0, time.FixedZone("CET", 3600))
+
+	root := NewRoot()
+	root.SetTimes(created, modified)
+	root.SetStateBits(0xA5A5A5A5)
+	sub, err := root.AddStorage("Sub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub.SetTimes(created, modified)
+	sub.SetStateBits(7)
+	if _, err := root.AddStorage("Unset"); err != nil {
+		t.Fatal(err)
+	}
+	if err := root.AddStream("Stream", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+
+	r := writeAndOpen(t, root)
+
+	if !r.Root.Created.IsZero() {
+		t.Fatalf("root Created = %v, want zero: the format forbids a root creation time", r.Root.Created)
+	}
+	if !r.Root.Modified.Equal(modified) || r.Root.StateBits != 0xA5A5A5A5 {
+		t.Fatalf("root Modified, StateBits = %v, %#x", r.Root.Modified, r.Root.StateBits)
+	}
+
+	got := r.Root.Find("Sub")
+	if !got.Created.Equal(created) || !got.Modified.Equal(modified) || got.StateBits != 7 {
+		t.Fatalf("Sub Created, Modified, StateBits = %v, %v, %d", got.Created, got.Modified, got.StateBits)
+	}
+	if got.Modified.Location() != time.UTC {
+		t.Fatalf("Modified location = %v, want UTC", got.Modified.Location())
+	}
+
+	for _, name := range []string{"Unset", "Stream"} {
+		e := r.Root.Find(name)
+		if !e.Created.IsZero() || !e.Modified.IsZero() || e.StateBits != 0 {
+			t.Fatalf("%s has metadata that was never set: %v, %v, %d", name, e.Created, e.Modified, e.StateBits)
 		}
 	}
 }

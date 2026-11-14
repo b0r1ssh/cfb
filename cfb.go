@@ -1,12 +1,38 @@
+// Package cfb reads and writes the Compound File Binary File Format
+// ([MS-CFB]), the structured-storage container behind legacy Microsoft
+// formats such as .msg, .doc, .xls, .ppt and .msi.
+//
+// A compound file is a small file system: a tree of storages (directories)
+// and streams (files). The package only deals with that container; it has
+// no knowledge of what any particular format stores in its streams.
+//
+// Use [Open] to read a file and walk the tree from
+// [Reader.Root]. Use [NewRoot] to build a tree in memory and
+// [Storage.WriteTo] to serialize it.
+//
+// [MS-CFB]: https://learn.microsoft.com/openspecs/windows_protocols/ms-cfb
 package cfb
 
 import (
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf16"
+)
+
+var (
+	// ErrNotCompoundFile reports that the input lacks the compound file
+	// signature or is too short to hold a header.
+	ErrNotCompoundFile = errors.New("cfb: not a compound file")
+	// ErrUnsupported reports a compound file whose version or sector
+	// geometry this package cannot read.
+	ErrUnsupported = errors.New("cfb: unsupported compound file")
+	// ErrCorrupt reports a structurally invalid compound file.
+	ErrCorrupt = errors.New("cfb: corrupt compound file")
 )
 
 const (
@@ -25,6 +51,10 @@ const (
 
 	nodeColorRed   = 0
 	nodeColorBlack = 1
+
+	// Timestamps are stored as FILETIME: 100 ns ticks since 1601-01-01 UTC.
+	filetimeTicksPerSecond = 10_000_000
+	filetimeUnixEpochSecs  = 11_644_473_600 // seconds from 1601-01-01 to 1970-01-01
 )
 
 var (
@@ -35,10 +65,10 @@ var (
 type EntryKind uint8
 
 const (
-	KindUnknown EntryKind = 0
-	KindStorage EntryKind = 1
-	KindStream  EntryKind = 2
-	KindRoot    EntryKind = 5
+	KindUnknown EntryKind = 0 // unallocated or unrecognized entry
+	KindStorage EntryKind = 1 // storage: contains other entries
+	KindStream  EntryKind = 2 // stream: contains bytes
+	KindRoot    EntryKind = 5 // root storage
 )
 
 func (k EntryKind) String() string {
@@ -93,6 +123,26 @@ func (c CLSID) String() string {
 }
 
 func (c CLSID) IsZero() bool { return c == CLSID{} }
+
+func filetimeToTime(ft uint64) time.Time {
+	if ft == 0 {
+		return time.Time{}
+	}
+	secs := int64(ft/filetimeTicksPerSecond) - filetimeUnixEpochSecs
+	nanos := int64(ft%filetimeTicksPerSecond) * 100
+	return time.Unix(secs, nanos).UTC()
+}
+
+func timeToFiletime(t time.Time) uint64 {
+	if t.IsZero() {
+		return 0
+	}
+	secs := t.Unix() + filetimeUnixEpochSecs
+	if secs < 0 {
+		return 0
+	}
+	return uint64(secs)*filetimeTicksPerSecond + uint64(t.Nanosecond()/100)
+}
 
 func sortKey(name string) []uint16 {
 	units := utf16.Encode([]rune(name))

@@ -7,17 +7,24 @@ import (
 	"io"
 	"math"
 	"sort"
+	"time"
 	"unicode/utf16"
 )
 
-const maxNameUnits = 31
+const (
+	maxNameUnits  = 31
+	maxStreamSize = math.MaxInt32 // version 3 files cap streams at 2 GiB
+)
 
 type Storage struct {
-	name    string
-	isRoot  bool
-	clsid   CLSID
-	entries []builderChild
-	taken   map[string]bool
+	name      string
+	isRoot    bool
+	clsid     CLSID
+	stateBits uint32
+	created   time.Time
+	modified  time.Time
+	entries   []builderChild
+	taken     map[string]bool
 }
 
 type builderChild struct {
@@ -34,6 +41,15 @@ func (s *Storage) SetCLSID(c CLSID) {
 	s.clsid = c
 }
 
+func (s *Storage) SetStateBits(bits uint32) {
+	s.stateBits = bits
+}
+
+func (s *Storage) SetTimes(created, modified time.Time) {
+	s.created = created
+	s.modified = modified
+}
+
 func (s *Storage) AddStorage(name string) (*Storage, error) {
 	if err := s.reserve(name); err != nil {
 		return nil, err
@@ -45,8 +61,8 @@ func (s *Storage) AddStorage(name string) (*Storage, error) {
 }
 
 func (s *Storage) AddStream(name string, data []byte) error {
-	if int64(len(data)) > math.MaxUint32 {
-		return fmt.Errorf("cfb: stream %q exceeds 4 GiB", name)
+	if int64(len(data)) > maxStreamSize {
+		return fmt.Errorf("cfb: stream %q exceeds 2 GiB", name)
 	}
 
 	if err := s.reserve(name); err != nil {
@@ -92,6 +108,8 @@ type plannedEntry struct {
 	color              uint8
 	left, right, child uint32
 	clsid              CLSID
+	stateBits          uint32
+	created, modified  uint64
 	start              uint32
 	size               uint64
 	data               []byte
@@ -165,6 +183,9 @@ func (s *Storage) buildPlan() []*plannedEntry {
 		right: noChild,
 		child: noChild,
 		clsid: s.clsid,
+		// The root entry's creation time must be zero.
+		stateBits: s.stateBits,
+		modified:  timeToFiletime(s.modified),
 	}}
 
 	var walk func(parentIdx int, dir *Storage)
@@ -175,6 +196,9 @@ func (s *Storage) buildPlan() []*plannedEntry {
 			if c.sub != nil {
 				e.kind = KindStorage
 				e.clsid = c.sub.clsid
+				e.stateBits = c.sub.stateBits
+				e.created = timeToFiletime(c.sub.created)
+				e.modified = timeToFiletime(c.sub.modified)
 			} else {
 				e.kind = KindStream
 				e.data = c.data
@@ -376,6 +400,9 @@ func encodeDirentArray(entries []*plannedEntry, slots int) []byte {
 		byteOrder.PutUint32(b[0x48:], e.right)
 		byteOrder.PutUint32(b[0x4C:], e.child)
 		copy(b[0x50:0x60], e.clsid[:])
+		byteOrder.PutUint32(b[0x60:], e.stateBits)
+		byteOrder.PutUint64(b[0x64:], e.created)
+		byteOrder.PutUint64(b[0x6C:], e.modified)
 		byteOrder.PutUint32(b[0x74:], e.start)
 		byteOrder.PutUint64(b[0x78:], e.size)
 	}
