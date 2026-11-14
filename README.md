@@ -1,8 +1,8 @@
 # cfb
 
-[![CI](https://github.com/b0r1ssh/go-xls/actions/workflows/go-test.yml/badge.svg)](https://github.com/b0r1ssh/go-xls/actions/workflows/go-test.yml)
-[![Go Reference](https://pkg.go.dev/badge/github.com/b0r1ssh/go-xls.svg)](https://pkg.go.dev/github.com/b0r1ssh/go-xls)
-[![codecov](https://codecov.io/gh/b0r1ssh/go-xls/graph/badge.svg?token=4PCHLI2CGJ)](https://codecov.io/gh/b0r1ssh/go-xls)
+[![CI](https://github.com/b0r1ssh/cfb/actions/workflows/go-test.yml/badge.svg)](https://github.com/b0r1ssh/cfb/actions/workflows/go-test.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/b0r1ssh/cfb.svg)](https://pkg.go.dev/github.com/b0r1ssh/cfb)
+[![codecov](https://codecov.io/gh/b0r1ssh/cfb/graph/badge.svg?token=F3K90H8KRN)](https://codecov.io/gh/b0r1ssh/cfb)
 
 Pure Go reader and writer for the Compound File Binary File Format
 ([MS-CFB]), the structured-storage container used by legacy Microsoft
