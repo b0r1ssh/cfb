@@ -3,9 +3,13 @@ package cfb
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
+	"math/rand"
 	"reflect"
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -483,4 +487,146 @@ func TestStreamSmallerThanMiniCutoffOutOfRangeMiniSector(t *testing.T) {
 	if _, err := io.ReadAll(s); err == nil {
 		t.Fatal("expected an error reading a mini sector beyond the mini stream container")
 	}
+}
+
+type countingReaderAt struct {
+	r     io.ReaderAt
+	calls atomic.Int64
+}
+
+func (c *countingReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	c.calls.Add(1)
+	return c.r.ReadAt(p, off)
+}
+
+// Every way of reading a stream returns its content, whatever its size and
+// however the reads are split.
+func TestReadPaths(t *testing.T) {
+	t.Parallel()
+
+	sizes := []int{0, 1, 63, 64, 65, 511, 512, 513, 4095, 4096, 4097, 20_000, 70_000}
+	root := NewRoot()
+	want := map[string][]byte{}
+	for i, size := range sizes {
+		name := fmt.Sprintf("S%02d", i)
+		want[name] = payload(size, int64(i))
+		if err := root.AddStream(name, want[name]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var file bytes.Buffer
+	if _, err := root.WriteTo(&file); err != nil {
+		t.Fatal(err)
+	}
+	c := &countingReaderAt{r: bytes.NewReader(file.Bytes())}
+	r, err := Open(c, int64(file.Len()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened := c.calls.Load()
+
+	rng := rand.New(rand.NewSource(1))
+	for name, data := range want {
+		e := r.Root.Find(name)
+		if got, err := e.Bytes(); err != nil || !bytes.Equal(got, data) {
+			t.Fatalf("%s Bytes: %d bytes, %v", name, len(got), err)
+		}
+		s, err := e.Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var chunks []byte
+		buf := make([]byte, 7)
+		for {
+			n, err := s.Read(buf)
+			chunks = append(chunks, buf[:n]...)
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		if !bytes.Equal(chunks, data) {
+			t.Fatalf("%s read in 7-byte chunks: %d bytes", name, len(chunks))
+		}
+		for range 20 {
+			if len(data) == 0 {
+				break
+			}
+			off := rng.Intn(len(data))
+			p := make([]byte, rng.Intn(len(data)-off)+1)
+			if n, err := s.ReadAt(p, int64(off)); err != nil && err != io.EOF || !bytes.Equal(p[:n], data[off:off+n]) || n != len(p) {
+				t.Fatalf("%s ReadAt(%d, %d): %d, %v", name, off, len(p), n, err)
+			}
+		}
+	}
+
+	// Whole sectors in a row are read at once, and the mini stream once.
+	c.calls.Store(0)
+	if _, err := r.Root.Find("S12").Bytes(); err != nil { // 70,000 bytes, 137 sectors
+		t.Fatal(err)
+	}
+	if n := c.calls.Load(); n > 3 {
+		t.Errorf("%d reads for a stream in consecutive sectors", n)
+	}
+	if opened > 5 {
+		t.Errorf("%d reads to open a small file", opened)
+	}
+}
+
+// A damaged file can record a stream much larger than its sector chain:
+// Bytes returns what the chain holds, without allocating the recorded size.
+func TestBytesOfOversizedStream(t *testing.T) {
+	t.Parallel()
+
+	root := NewRoot()
+	data := payload(10_000, 9)
+	if err := root.AddStream("Data", data); err != nil {
+		t.Fatal(err)
+	}
+	var file bytes.Buffer
+	if _, err := root.WriteTo(&file); err != nil {
+		t.Fatal(err)
+	}
+	raw := file.Bytes()
+	dir := bytes.Index(raw, []byte{'D', 0, 'a', 0, 't', 0, 'a', 0, 0, 0})
+	if dir < 0 {
+		t.Fatal("directory entry not found")
+	}
+	byteOrder.PutUint32(raw[dir+0x78:], 0x7fffffff) // version 3 sizes have 32 bits
+	r, err := Open(bytes.NewReader(raw), int64(len(raw)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := r.Root.Find("Data").Bytes()
+	if !errors.Is(err, io.ErrUnexpectedEOF) || !bytes.Equal(got[:len(data)], data) || len(got) > 64<<10 {
+		t.Fatalf("Bytes: %d bytes, %v", len(got), err)
+	}
+}
+
+// A Reader can be read from several goroutines; run with -race.
+func TestConcurrentReads(t *testing.T) {
+	t.Parallel()
+
+	root := NewRoot()
+	for i := range 40 {
+		if err := root.AddStream(fmt.Sprintf("S%d", i), payload(100+i*300, int64(i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r := writeAndOpen(t, root)
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range 40 {
+				if got, err := r.Root.Find(fmt.Sprintf("S%d", i)).Bytes(); err != nil || !bytes.Equal(got, payload(100+i*300, int64(i))) {
+					t.Errorf("S%d: %v", i, err)
+				}
+			}
+		}()
+	}
+	wg.Wait()
 }

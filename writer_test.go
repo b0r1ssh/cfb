@@ -2,6 +2,8 @@ package cfb
 
 import (
 	"bytes"
+	"errors"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -372,5 +374,97 @@ func TestBuildHeaderDifatField(t *testing.T) {
 	}
 	if got := byteOrder.Uint32(b[0x48:]); got != 0 {
 		t.Fatalf("difat sector count = %d, want 0", got)
+	}
+}
+
+type closeCounter struct {
+	io.Reader
+	closed *int
+}
+
+func (c closeCounter) Close() error {
+	*c.closed++
+	return nil
+}
+
+func TestAddStreamFrom(t *testing.T) {
+	t.Parallel()
+
+	small, big := payload(100, 3), payload(10_000, 4)
+	closed := 0
+	from := func(b []byte) func() (io.Reader, error) {
+		return func() (io.Reader, error) { return closeCounter{bytes.NewReader(b), &closed}, nil }
+	}
+
+	streamed, held := NewRoot(), NewRoot()
+	for _, s := range []*Storage{streamed, held} {
+		sub, err := s.AddStorage("Sub")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s == streamed {
+			err = errors.Join(s.AddStreamFrom("Small", int64(len(small)), from(small)),
+				sub.AddStreamFrom("Big", int64(len(big)), from(big)), s.AddStreamFrom("Empty", 0, from(nil)))
+		} else {
+			err = errors.Join(s.AddStream("Small", small), sub.AddStream("Big", big), s.AddStream("Empty", nil))
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// A stream read from a source is written as one given whole.
+	var a, b bytes.Buffer
+	if _, err := streamed.WriteTo(&a); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := held.WriteTo(&b); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(a.Bytes(), b.Bytes()) {
+		t.Fatal("a streamed file differs from the same file written from memory")
+	}
+	if closed != 2 { // the source of the empty stream is not opened
+		t.Fatalf("%d sources closed, want 2", closed)
+	}
+
+	r := writeAndOpen(t, streamed)
+	if got, err := r.Root.Lookup("Sub/Big").Bytes(); err != nil || !bytes.Equal(got, big) {
+		t.Fatalf("Big: %d bytes, %v", len(got), err)
+	}
+	if got, err := r.Root.Find("Small").Bytes(); err != nil || !bytes.Equal(got, small) {
+		t.Fatalf("Small: %d bytes, %v", len(got), err)
+	}
+
+	// Extra bytes are ignored; missing ones fail the write.
+	extra := NewRoot()
+	if err := extra.AddStreamFrom("S", 10, from(big)); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := writeAndOpen(t, extra).Root.Find("S").Bytes(); err != nil || !bytes.Equal(got, big[:10]) {
+		t.Fatalf("first bytes of a longer source: %x, %v", got, err)
+	}
+	short := NewRoot()
+	if err := short.AddStreamFrom("S", 5000, from(small)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := short.WriteTo(io.Discard); err == nil || !strings.Contains(err.Error(), "100 of its 5000 bytes") {
+		t.Fatalf("short source: %v", err)
+	}
+	failing := NewRoot()
+	if err := failing.AddStreamFrom("S", 1, func() (io.Reader, error) { return nil, io.ErrClosedPipe }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := failing.WriteTo(io.Discard); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("failing source: %v", err)
+	}
+
+	for _, size := range []int64{-1, maxStreamSize + 1} {
+		if err := NewRoot().AddStreamFrom("S", size, from(nil)); err == nil {
+			t.Errorf("size %d accepted", size)
+		}
+	}
+	if err := NewRoot().AddStreamFrom("S", 1, nil); err == nil {
+		t.Error("a stream without source accepted")
 	}
 }

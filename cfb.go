@@ -21,7 +21,6 @@ import (
 	"strings"
 	"time"
 	"unicode"
-	"unicode/utf16"
 )
 
 var (
@@ -145,15 +144,16 @@ func timeToFiletime(t time.Time) uint64 {
 }
 
 func sortKey(name string) []uint16 {
-	units := utf16.Encode([]rune(name))
-	out := make([]uint16, len(units))
-	for i, u := range units {
-		out[i] = upperCodeUnit(u)
-	}
-	return out
+	return upperAll(nameUnits(name))
 }
 
 func upperCodeUnit(u uint16) uint16 {
+	if u < 0x80 {
+		if u >= 'a' && u <= 'z' {
+			return u - 'a' + 'A'
+		}
+		return u
+	}
 	if u >= 0xD800 && u <= 0xDFFF {
 		return u
 	}
@@ -164,7 +164,12 @@ func upperCodeUnit(u uint16) uint16 {
 }
 
 func compareNames(a, b string) int {
-	ka, kb := sortKey(a), sortKey(b)
+	return compareKeys(sortKey(a), sortKey(b))
+}
+
+// compareKeys orders names by their upper-case code units: shorter names
+// first, then unit by unit ([MS-CFB] 2.6.4).
+func compareKeys(ka, kb []uint16) int {
 	if len(ka) != len(kb) {
 		if len(ka) < len(kb) {
 			return -1
