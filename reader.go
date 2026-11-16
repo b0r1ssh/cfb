@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"math"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf16"
 )
@@ -23,6 +24,11 @@ type Reader struct {
 	miniFat []uint32
 
 	rootChain []uint32
+
+	// The mini stream, read whole the first time a small stream is read.
+	miniOnce sync.Once
+	miniData []byte
+	miniErr  error
 
 	Root *Entry
 }
@@ -139,7 +145,23 @@ func (e *Entry) Bytes() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return io.ReadAll(s)
+
+	// The buffer holds the stream, or what its sector chain can hold when
+	// the size recorded by a damaged file is larger.
+	unit := int64(s.r.sectorSize)
+	if s.mini {
+		unit = miniSectSize
+	}
+	size := min(s.size, int64(len(s.chain))*unit)
+	buf := make([]byte, size)
+	n, err := io.ReadFull(s, buf)
+	if err != nil {
+		return buf[:n], err
+	}
+	if size < s.size {
+		return buf, io.ErrUnexpectedEOF
+	}
+	return buf, nil
 }
 
 func Open(src io.ReaderAt, size int64) (*Reader, error) {
@@ -191,15 +213,14 @@ func Open(src io.ReaderAt, size int64) (*Reader, error) {
 		return nil, err
 	}
 
-	for _, s := range fatLocators {
-		sec, err := r.sector(s)
-		if err != nil {
-			return nil, err
-		}
+	fatBytes := make([]byte, len(fatLocators)*r.sectorSize)
+	if err := r.readSectors(fatLocators, fatBytes); err != nil {
+		return nil, err
+	}
 
-		for i := 0; i < r.sectorSize/4; i++ {
-			r.fat = append(r.fat, byteOrder.Uint32(sec[4*i:]))
-		}
+	r.fat = make([]uint32, len(fatBytes)/4)
+	for i := range r.fat {
+		r.fat[i] = byteOrder.Uint32(fatBytes[4*i:])
 	}
 
 	dirBytes, err := r.readMetadataChain(dirStart)
@@ -290,9 +311,26 @@ func parseDirentArray(data []byte, version uint16) []dirent {
 	return out
 }
 
+// decodeName decodes the UTF-16 name of an entry, directly when it is ASCII.
+func decodeName(units []uint16) string {
+	for _, u := range units {
+		if u >= 0x80 {
+			return string(utf16.Decode(units))
+		}
+	}
+
+	var s strings.Builder
+	s.Grow(len(units))
+	for _, u := range units {
+		s.WriteByte(byte(u))
+	}
+	return s.String()
+}
+
 func (d *dirent) parse(b []byte) {
 	nameLen := min(int(byteOrder.Uint16(b[0x40:])), 64)
-	var units []uint16
+	var buf [32]uint16
+	units := buf[:0]
 	for i := 0; i+1 < nameLen; i += 2 {
 		u := byteOrder.Uint16(b[i:])
 		if u == 0 {
@@ -300,7 +338,7 @@ func (d *dirent) parse(b []byte) {
 		}
 		units = append(units, u)
 	}
-	d.name = string(utf16.Decode(units))
+	d.name = decodeName(units)
 	d.kind = EntryKind(b[0x42])
 	d.left = byteOrder.Uint32(b[0x44:])
 	d.right = byteOrder.Uint32(b[0x48:])
@@ -385,23 +423,69 @@ func (r *Reader) sector(n uint32) ([]byte, error) {
 }
 
 func (r *Reader) readMetadataChain(start uint32) ([]byte, error) {
-	var out []byte
+	var chain []uint32
 	s := start
 	for n := 0; s != sectorEndOfChain; n++ {
 		// A chain holding more bytes than the file must revisit a sector.
-		if int(s) >= len(r.fat) || n > len(r.fat) || int64(len(out)) >= r.size {
+		if int(s) >= len(r.fat) || n > len(r.fat) || int64(len(chain))*int64(r.sectorSize) >= r.size {
 			return nil, fmt.Errorf("%w: sector chain is broken or cyclic", ErrCorrupt)
 		}
 
-		sec, err := r.sector(s)
-		if err != nil {
-			return nil, err
-		}
-
-		out = append(out, sec...)
+		chain = append(chain, s)
 		s = r.fat[s]
 	}
+
+	out := make([]byte, len(chain)*r.sectorSize)
+	if err := r.readSectors(chain, out); err != nil {
+		return nil, err
+	}
 	return out, nil
+}
+
+// readSectors reads the regular sectors of a chain into dst, which holds
+// them all, with one read for each run of consecutive sectors.
+func (r *Reader) readSectors(chain []uint32, dst []byte) error {
+	for i := 0; i < len(chain); {
+		run := 1
+		for i+run < len(chain) && chain[i+run] == chain[i]+uint32(run) {
+			run++
+		}
+		if err := r.readRun(chain[i], run, dst[i*r.sectorSize:(i+run)*r.sectorSize]); err != nil {
+			return err
+		}
+		i += run
+	}
+	return nil
+}
+
+// readRun reads count consecutive sectors from sector first into dst, with
+// the checks of sector.
+func (r *Reader) readRun(first uint32, count int, dst []byte) error {
+	last := uint64(first) + uint64(count) - 1
+	if last > sectorMaxRegular {
+		return fmt.Errorf("%w: sector number %#x is a reserved value", ErrCorrupt, last)
+	}
+
+	off := (int64(first) + 1) * int64(r.sectorSize)
+	if (int64(last)+2)*int64(r.sectorSize) > r.size {
+		return fmt.Errorf("%w: sector %d is beyond the end of the file", ErrCorrupt, last)
+	}
+
+	if _, err := r.src.ReadAt(dst, off); err != nil {
+		return fmt.Errorf("cfb: reading sector %d: %w", first, err)
+	}
+	return nil
+}
+
+// miniStream returns the mini stream, which it reads whole the first time.
+func (r *Reader) miniStream() ([]byte, error) {
+	r.miniOnce.Do(func() {
+		data := make([]byte, len(r.rootChain)*r.sectorSize)
+		if r.miniErr = r.readSectors(r.rootChain, data); r.miniErr == nil {
+			r.miniData = data
+		}
+	})
+	return r.miniData, r.miniErr
 }
 
 func (r *Reader) sectorChain(start uint32, mini bool, limit int) ([]uint32, error) {
@@ -479,6 +563,19 @@ func (s *Stream) ReadAt(p []byte, off int64) (int, error) {
 			return n, io.ErrUnexpectedEOF
 		}
 		within := int(cur % unit)
+		if !s.mini && within == 0 && len(p)-n >= int(unit) {
+			// Whole sectors: each run of consecutive ones is read at once,
+			// straight into p.
+			run, most := 1, (len(p)-n)/int(unit)
+			for run < most && idx+run < len(s.chain) && s.chain[idx+run] == s.chain[idx]+uint32(run) {
+				run++
+			}
+			if err := s.r.readRun(s.chain[idx], run, p[n:n+run*int(unit)]); err != nil {
+				return n, err
+			}
+			n += run * int(unit)
+			continue
+		}
 		toRead := int(unit) - within
 		if rem := len(p) - n; toRead > rem {
 			toRead = rem
@@ -558,9 +655,13 @@ func (s *Stream) regularSectorBytes(id uint32, from int) ([]byte, error) {
 func (s *Stream) miniSectorBytes(miniID uint32, within int) ([]byte, error) {
 	byteOff := int64(miniID)*miniSectSize + int64(within)
 	mainIdx := int(byteOff / int64(s.r.sectorSize))
-	mainWithin := int(byteOff % int64(s.r.sectorSize))
 	if mainIdx >= len(s.r.rootChain) {
 		return nil, fmt.Errorf("%w: mini sector %d is beyond the mini stream container", ErrCorrupt, miniID)
 	}
-	return s.regularSectorBytes(s.r.rootChain[mainIdx], mainWithin)
+	mini, err := s.r.miniStream()
+	if err != nil {
+		return nil, err
+	}
+	end := (byteOff/miniSectSize + 1) * miniSectSize
+	return mini[byteOff:end], nil
 }

@@ -28,9 +28,13 @@ type Storage struct {
 }
 
 type builderChild struct {
-	name string
-	sub  *Storage
-	data []byte
+	name  string
+	units []uint16 // the name in UTF-16
+	key   []uint16 // units in upper case, which order and compare names
+	sub   *Storage
+	data  []byte
+	size  int64
+	open  func() (io.Reader, error) // the content of a stream added with AddStreamFrom
 }
 
 func NewRoot() *Storage {
@@ -51,12 +55,13 @@ func (s *Storage) SetTimes(created, modified time.Time) {
 }
 
 func (s *Storage) AddStorage(name string) (*Storage, error) {
-	if err := s.reserve(name); err != nil {
+	units, key, err := s.reserve(name)
+	if err != nil {
 		return nil, err
 	}
 
 	sub := &Storage{name: name, taken: map[string]bool{}}
-	s.entries = append(s.entries, builderChild{name: name, sub: sub})
+	s.entries = append(s.entries, builderChild{name: name, units: units, key: key, sub: sub})
 	return sub, nil
 }
 
@@ -65,33 +70,91 @@ func (s *Storage) AddStream(name string, data []byte) error {
 		return fmt.Errorf("cfb: stream %q exceeds 2 GiB", name)
 	}
 
-	if err := s.reserve(name); err != nil {
+	units, key, err := s.reserve(name)
+	if err != nil {
 		return err
 	}
 
-	s.entries = append(s.entries, builderChild{name: name, data: data})
+	s.entries = append(s.entries, builderChild{name: name, units: units, key: key, data: data, size: int64(len(data))})
 	return nil
 }
 
-func (s *Storage) reserve(name string) error {
-	units := utf16.Encode([]rune(name))
+func (s *Storage) AddStreamFrom(name string, size int64, open func() (io.Reader, error)) error {
+	if size < 0 || size > maxStreamSize {
+		return fmt.Errorf("cfb: stream %q size %d is not between 0 and 2 GiB", name, size)
+	}
+
+	if open == nil {
+		return fmt.Errorf("cfb: stream %q has no content", name)
+	}
+
+	units, key, err := s.reserve(name)
+	if err != nil {
+		return err
+	}
+
+	s.entries = append(s.entries, builderChild{name: name, units: units, key: key, size: size, open: open})
+	return nil
+}
+
+func (s *Storage) reserve(name string) (units, key []uint16, err error) {
+	units = nameUnits(name)
 	if len(units) == 0 || len(units) > maxNameUnits {
-		return fmt.Errorf("cfb: name %q must be 1-%d UTF-16 code units", name, maxNameUnits)
+		return nil, nil, fmt.Errorf("cfb: name %q must be 1-%d UTF-16 code units", name, maxNameUnits)
 	}
 
 	for _, r := range name {
 		if r == '/' || r == '\\' || r == ':' || r == '!' {
-			return fmt.Errorf("cfb: name %q contains a reserved character", name)
+			return nil, nil, fmt.Errorf("cfb: name %q contains a reserved character", name)
 		}
 	}
 
-	key := string(utf16.Decode(upperAll(units)))
-	if s.taken[key] {
-		return fmt.Errorf("cfb: duplicate name %q", name)
+	key = upperAll(units)
+	taken := takenKey(key)
+	if s.taken[taken] {
+		return nil, nil, fmt.Errorf("cfb: duplicate name %q", name)
 	}
 
-	s.taken[key] = true
-	return nil
+	s.taken[taken] = true
+	return units, key, nil
+}
+
+// nameUnits encodes a name in UTF-16, directly for an ASCII name.
+func nameUnits(name string) []uint16 {
+	for i := 0; i < len(name); i++ {
+		if name[i] >= 0x80 {
+			return utf16.Encode([]rune(name))
+		}
+	}
+
+	units := make([]uint16, len(name))
+	for i := 0; i < len(name); i++ {
+		units[i] = uint16(name[i])
+	}
+	return units
+}
+
+// takenKey turns upper-case code units into a map key: the bytes of an
+// ASCII name, or a NUL, which names cannot hold, then the units.
+func takenKey(key []uint16) string {
+	ascii := true
+	for _, u := range key {
+		ascii = ascii && u < 0x80
+	}
+
+	if ascii {
+		b := make([]byte, len(key))
+		for i, u := range key {
+			b[i] = byte(u)
+		}
+		return string(b)
+	}
+
+	b := make([]byte, 1, 1+2*len(key))
+	for _, u := range key {
+		b = byteOrder.AppendUint16(b, u)
+	}
+	return string(b)
 }
 
 func upperAll(units []uint16) []uint16 {
@@ -104,6 +167,8 @@ func upperAll(units []uint16) []uint16 {
 
 type plannedEntry struct {
 	name               string
+	units, key         []uint16
+	open               func() (io.Reader, error)
 	kind               EntryKind
 	color              uint8
 	left, right, child uint32
@@ -124,17 +189,21 @@ func (s *Storage) WriteTo(w io.Writer) (int64, error) {
 	entries := s.buildPlan()
 
 	small, large := splitBySize(entries[1:])
-	miniFat, miniBytes := layoutMiniStream(small)
+	miniFat, miniSize := layoutMiniStream(small)
 
 	alloc := &sectorAllocator{}
+	sectors := 0
 	for _, e := range large {
-		e.start = alloc.chain(divRoundUp(len(e.data), sectorSize512))
+		n := divRoundUp(int(e.size), sectorSize512)
+		e.start = alloc.chain(n)
+		sectors += n
 	}
 	root := entries[0]
 	root.start = sectorEndOfChain
 	if len(miniFat) > 0 {
-		root.start = alloc.chain(divRoundUp(len(miniBytes), sectorSize512))
-		root.size = uint64(len(miniBytes))
+		root.start = alloc.chain(divRoundUp(miniSize, sectorSize512))
+		root.size = uint64(miniSize)
+		sectors += divRoundUp(miniSize, sectorSize512)
 	}
 	miniFatSectors := divRoundUp(len(miniFat)*4, sectorSize512)
 	miniFatStart := uint32(sectorEndOfChain)
@@ -152,13 +221,24 @@ func (s *Storage) WriteTo(w io.Writer) (int64, error) {
 		fatStart: fatStart,
 	})
 
-	out := &countWriter{w: bufio.NewWriterSize(w, 64*1024)}
+	// The size of the file is known: a buffer as large as it is enough.
+	sectors += miniFatSectors + dirSectors + fatSectors + difatSectors
+	total := (1 + sectors) * sectorSize512
+	if g, ok := w.(interface{ Grow(n int) }); ok {
+		g.Grow(total)
+	}
+	out := &countWriter{w: bufio.NewWriterSize(w, min(64*1024, total))}
 	out.write(head)
 	for _, e := range large {
-		out.writeAligned(e.data, sectorSize512)
+		out.writeStream(e, sectorSize512)
 	}
 	if len(miniFat) > 0 {
-		out.writeAligned(miniBytes, sectorSize512)
+		for _, e := range small {
+			out.writeStream(e, miniSectSize)
+		}
+		if r := miniSize % sectorSize512; r != 0 {
+			out.write(zeroSector[:sectorSize512-r])
+		}
 	}
 	if miniFatSectors > 0 {
 		out.write(encodeU32Table(miniFat, miniFatSectors*sectorSize512/4))
@@ -177,6 +257,7 @@ func (s *Storage) WriteTo(w io.Writer) (int64, error) {
 func (s *Storage) buildPlan() []*plannedEntry {
 	entries := []*plannedEntry{{
 		name:  "Root Entry",
+		units: nameUnits("Root Entry"),
 		kind:  KindRoot,
 		color: nodeColorBlack,
 		left:  noChild,
@@ -192,7 +273,7 @@ func (s *Storage) buildPlan() []*plannedEntry {
 	walk = func(parentIdx int, dir *Storage) {
 		ids := make([]int, len(dir.entries))
 		for i, c := range dir.entries {
-			e := &plannedEntry{name: c.name, left: noChild, right: noChild, child: noChild}
+			e := &plannedEntry{name: c.name, units: c.units, key: c.key, left: noChild, right: noChild, child: noChild}
 			if c.sub != nil {
 				e.kind = KindStorage
 				e.clsid = c.sub.clsid
@@ -201,8 +282,8 @@ func (s *Storage) buildPlan() []*plannedEntry {
 				e.modified = timeToFiletime(c.sub.modified)
 			} else {
 				e.kind = KindStream
-				e.data = c.data
-				e.size = uint64(len(c.data))
+				e.data, e.open = c.data, c.open
+				e.size = uint64(c.size)
 			}
 
 			entries = append(entries, e)
@@ -214,7 +295,7 @@ func (s *Storage) buildPlan() []*plannedEntry {
 		// still find each child's entry after the sort below reorders ids.
 		origIDs := append([]int(nil), ids...)
 		sort.Slice(ids, func(i, j int) bool {
-			return compareNames(entries[ids[i]].name, entries[ids[j]].name) < 0
+			return compareKeys(entries[ids[i]].key, entries[ids[j]].key) < 0
 		})
 		entries[parentIdx].child = buildBalancedBST(entries, ids, 0)
 		colorByDepth(entries, ids)
@@ -275,9 +356,15 @@ func splitBySize(entries []*plannedEntry) (small, large []*plannedEntry) {
 	return small, large
 }
 
-func layoutMiniStream(small []*plannedEntry) (miniFat []uint32, data []byte) {
+func layoutMiniStream(small []*plannedEntry) (miniFat []uint32, size int) {
+	sectors := 0
 	for _, e := range small {
-		n := divRoundUp(len(e.data), miniSectSize)
+		sectors += divRoundUp(int(e.size), miniSectSize)
+	}
+
+	miniFat = make([]uint32, 0, sectors)
+	for _, e := range small {
+		n := divRoundUp(int(e.size), miniSectSize)
 		e.start = uint32(len(miniFat))
 		for k := range n {
 			next := uint32(len(miniFat) + 1) // len(miniFat) already grew by k from the appends below
@@ -286,12 +373,8 @@ func layoutMiniStream(small []*plannedEntry) (miniFat []uint32, data []byte) {
 			}
 			miniFat = append(miniFat, next)
 		}
-		data = append(data, e.data...)
-		if pad := len(e.data) % miniSectSize; pad != 0 {
-			data = append(data, make([]byte, miniSectSize-pad)...)
-		}
 	}
-	return miniFat, data
+	return miniFat, sectors * miniSectSize
 }
 
 type sectorAllocator struct {
@@ -389,7 +472,10 @@ func encodeDirentArray(entries []*plannedEntry, slots int) []byte {
 			continue
 		}
 		e := entries[i]
-		units := utf16.Encode([]rune(e.name))
+		units := e.units
+		if units == nil {
+			units = nameUnits(e.name)
+		}
 		for j, u := range units {
 			byteOrder.PutUint16(b[2*j:], u)
 		}
@@ -458,6 +544,38 @@ func (c *countWriter) write(p []byte) {
 }
 
 var zeroSector [sectorSize512]byte
+
+func (c *countWriter) writeStream(e *plannedEntry, align int) {
+	if e.open == nil {
+		c.writeAligned(e.data, align)
+		return
+	}
+	if c.err != nil {
+		return
+	}
+
+	r, err := e.open()
+	if err != nil {
+		c.err = fmt.Errorf("cfb: stream %q: %w", e.name, err)
+		return
+	}
+	if closer, ok := r.(io.Closer); ok {
+		defer func() { _ = closer.Close() }()
+	}
+
+	n, err := io.CopyN(c.w, r, int64(e.size))
+	c.n += n
+	if err == io.EOF {
+		err = fmt.Errorf("cfb: stream %q has %d of its %d bytes", e.name, n, e.size)
+	}
+	if err != nil {
+		c.err = err
+		return
+	}
+	if r := int(e.size % uint64(align)); r != 0 {
+		c.write(zeroSector[:align-r])
+	}
+}
 
 func (c *countWriter) writeAligned(p []byte, align int) {
 	c.write(p)

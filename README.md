@@ -29,7 +29,9 @@ contains.
   that writes version 3 (512-byte sector) files, which is what Outlook and
   Excel themselves produce. Reading accepts versions 3 and 4. Storages can
   carry a CLSID, state bits and timestamps; streams are limited to 2 GiB,
-  the version 3 maximum.
+  the version 3 maximum. `AddStreamFrom` adds a stream whose content is
+  read from an `io.Reader` while the file is written, so that large streams
+  are not held in memory.
 
 ## Install
 
